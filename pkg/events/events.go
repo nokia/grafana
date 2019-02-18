@@ -54,16 +54,16 @@ type OrgCreated struct {
 	Timestamp time.Time `json:"timestamp"`
 	Id        int64     `json:"id"`
 	Name      string    `json:"name"`
-	Tenantlabel      string    `json:"name"`
-	Tenantvalue      string    `json:"name"`
+	Tenantlabel      string    `json:"tenantlabel"`
+	Tenantvalue      string    `json:"tenantlabel"`
 }
 
 type OrgUpdated struct {
 	Timestamp time.Time `json:"timestamp"`
 	Id        int64     `json:"id"`
 	Name      string    `json:"name"`
-	Tenantlabel      string    `json:"name"`
-	Tenantvalue      string    `json:"name"`
+	Tenantlabel      string    `json:"tenantlabel"`
+	Tenantvalue      string    `json:"tenantlabel"`
 }
 
 type UserCreated struct {
