@@ -55,7 +55,7 @@ type OrgCreated struct {
 	Id        int64     `json:"id"`
 	Name      string    `json:"name"`
 	Tenantlabel      string    `json:"tenantlabel"`
-	Tenantvalue      string    `json:"tenantlabel"`
+	Tenantvalue      string    `json:"tenantvalue"`
 }
 
 type OrgUpdated struct {
@@ -63,7 +63,7 @@ type OrgUpdated struct {
 	Id        int64     `json:"id"`
 	Name      string    `json:"name"`
 	Tenantlabel      string    `json:"tenantlabel"`
-	Tenantvalue      string    `json:"tenantlabel"`
+	Tenantvalue      string    `json:"tenantvalue"`
 }
 
 type UserCreated struct {
