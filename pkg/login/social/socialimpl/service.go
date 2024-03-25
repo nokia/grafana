@@ -3,12 +3,11 @@ package socialimpl
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/ini.v1"
@@ -34,6 +33,15 @@ type SocialService struct {
 
 	socialMap map[string]social.SocialConnector
 	log       log.Logger
+	tlsCerts  TLSCerts
+}
+
+type TLSCerts struct {
+	certLock  sync.RWMutex
+	certMtime time.Time
+	keyMtime  time.Time
+	caMtime   time.Time
+	certs     *tls.Config
 }
 
 func ProvideService(cfg *setting.Cfg,
@@ -127,12 +135,15 @@ func (ss *SocialService) GetOAuthHttpClient(name string) (*http.Client, error) {
 		return nil, fmt.Errorf("oauth provider %q is not enabled", name)
 	}
 
+	tc, err := ss.readCertificates(name, info)
+	if err != nil {
+		return nil, err
+	}
+
 	// handle call back
 	tr := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: info.TlsSkipVerify,
-		},
+		Proxy:           http.ProxyFromEnvironment,
+		TLSClientConfig: tc,
 		DialContext: (&net.Dialer{
 			Timeout:   time.Second * 10,
 			KeepAlive: 30 * time.Second,
@@ -148,26 +159,15 @@ func (ss *SocialService) GetOAuthHttpClient(name string) (*http.Client, error) {
 		Timeout:   time.Second * 15,
 	}
 
-	if info.TlsClientCert != "" || info.TlsClientKey != "" {
-		cert, err := tls.LoadX509KeyPair(info.TlsClientCert, info.TlsClientKey)
-		if err != nil {
-			ss.log.Error("Failed to setup TlsClientCert", "oauth", name, "error", err)
-			return nil, fmt.Errorf("failed to setup TlsClientCert: %w", err)
-		}
-
-		tr.TLSClientConfig.Certificates = append(tr.TLSClientConfig.Certificates, cert)
+	if info.CertWatchInterval > 0 {
+		// what does this do?
+		tr.TLSClientConfig.GetConfigForClient = ss.GetClientConfig
+		go ss.WatchAndUpdateCerts(name, info)
+		ss.log.Debug("HTTP Server certificates reload feature is enabled")
+	} else {
+		ss.log.Debug("HTTP Server certificates reload feature is NOT enabled")
 	}
 
-	if info.TlsClientCa != "" {
-		caCert, err := os.ReadFile(info.TlsClientCa)
-		if err != nil {
-			ss.log.Error("Failed to setup TlsClientCa", "oauth", name, "error", err)
-			return nil, fmt.Errorf("failed to setup TlsClientCa: %w", err)
-		}
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(caCert)
-		tr.TLSClientConfig.RootCAs = caCertPool
-	}
 	return oauthClient, nil
 }
 
