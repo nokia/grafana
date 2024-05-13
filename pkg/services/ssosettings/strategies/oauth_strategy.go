@@ -96,6 +96,7 @@ func (s *OAuthStrategy) loadSettingsForProvider(provider string) map[string]any 
 		"tls_client_key":             section.Key("tls_client_key").Value(),
 		"tls_client_ca":              section.Key("tls_client_ca").Value(),
 		"tls_skip_verify_insecure":   section.Key("tls_skip_verify_insecure").MustBool(false),
+		"certs_refresh_interval":     section.Key("certs_refresh_interval").Value(),
 		"use_pkce":                   section.Key("use_pkce").MustBool(false),
 		"use_refresh_token":          section.Key("use_refresh_token").MustBool(false),
 		"allow_assign_grafana_admin": section.Key("allow_assign_grafana_admin").MustBool(false),

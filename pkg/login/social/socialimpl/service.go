@@ -3,12 +3,12 @@ package socialimpl
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/ini.v1"
@@ -18,6 +18,7 @@ import (
 	"github.com/grafana/grafana/pkg/infra/usagestats"
 	"github.com/grafana/grafana/pkg/login/social"
 	"github.com/grafana/grafana/pkg/login/social/connectors"
+	"github.com/grafana/grafana/pkg/login/social/utils"
 	"github.com/grafana/grafana/pkg/services/featuremgmt"
 	"github.com/grafana/grafana/pkg/services/ssosettings"
 	"github.com/grafana/grafana/pkg/services/supportbundles"
@@ -27,6 +28,7 @@ import (
 var (
 	allOauthes = []string{social.GitHubProviderName, social.GitlabProviderName, social.GoogleProviderName, social.GenericOAuthProviderName, social.GrafanaNetProviderName,
 		social.GrafanaComProviderName, social.AzureADProviderName, social.OktaProviderName}
+	once sync.Once
 )
 
 type SocialService struct {
@@ -34,6 +36,12 @@ type SocialService struct {
 
 	socialMap map[string]social.SocialConnector
 	log       log.Logger
+	tlsCerts  TLSClientCerts
+}
+type TLSClientCerts struct {
+	certs                *tls.Certificate
+	nextRefreshTimestamp atomic.Uint64
+	certRefreshDuration  uint64
 }
 
 func ProvideService(cfg *setting.Cfg,
@@ -65,6 +73,19 @@ func ProvideService(cfg *setting.Cfg,
 			}
 
 			conn, err := createOAuthConnector(ssoSetting.Provider, info, cfg, ssoSettings, features, cache)
+			if info.CertWatchInterval != "" && (info.TlsClientCert != "" || info.TlsClientKey != "") {
+				// spin up a time ticker routine used to watch and reload of client certificates
+				// invoking it only once irrespective of the number of providers enabled
+				once.Do(utils.InitTimeTicker)
+				refreshInterval, err := time.ParseDuration(info.CertWatchInterval)
+				if err != nil {
+					ss.log.Error("Failed to create OAuth provider", "error", err)
+				}
+				ss.tlsCerts = TLSClientCerts{
+					certRefreshDuration: utils.GetCertRefreshInterval(refreshInterval),
+				}
+				ss.tlsCerts.nextRefreshTimestamp.Store(0)
+			}
 			if err != nil {
 				ss.log.Error("Failed to create OAuth provider", "error", err, "provider", ssoSetting.Provider)
 				continue
@@ -95,6 +116,19 @@ func ProvideService(cfg *setting.Cfg,
 			conn, _ := createOAuthConnector(name, info, cfg, ssoSettings, features, cache)
 
 			ss.socialMap[name] = conn
+			if info.CertWatchInterval != "" && (info.TlsClientCert != "" || info.TlsClientKey != "") {
+				// spin up a time ticker routine used to watch and reload of client certificates
+				// invoking it only once irrespective of the number of providers enabled
+				once.Do(utils.InitTimeTicker)
+				refreshInterval, err := time.ParseDuration(info.CertWatchInterval)
+				if err != nil {
+					ss.log.Error("Failed to create OAuth provider", "error", err)
+				}
+				ss.tlsCerts = TLSClientCerts{
+					certRefreshDuration: utils.GetCertRefreshInterval(refreshInterval),
+				}
+				ss.tlsCerts.nextRefreshTimestamp.Store(0)
+			}
 		}
 	}
 
@@ -147,27 +181,33 @@ func (ss *SocialService) GetOAuthHttpClient(name string) (*http.Client, error) {
 		Transport: tr,
 		Timeout:   time.Second * 15,
 	}
-
-	if info.TlsClientCert != "" || info.TlsClientKey != "" {
-		cert, err := tls.LoadX509KeyPair(info.TlsClientCert, info.TlsClientKey)
+	if info.CertWatchInterval != "" {
+		cert, err := ss.readCertificates(info)
 		if err != nil {
 			ss.log.Error("Failed to setup TlsClientCert", "oauth", name, "error", err)
 			return nil, fmt.Errorf("failed to setup TlsClientCert: %w", err)
 		}
-
-		tr.TLSClientConfig.Certificates = append(tr.TLSClientConfig.Certificates, cert)
-	}
-
-	if info.TlsClientCa != "" {
-		caCert, err := os.ReadFile(info.TlsClientCa)
-		if err != nil {
-			ss.log.Error("Failed to setup TlsClientCa", "oauth", name, "error", err)
-			return nil, fmt.Errorf("failed to setup TlsClientCa: %w", err)
+		tr.TLSClientConfig.Certificates = append(tr.TLSClientConfig.Certificates, *cert)
+	} else {
+		tr.TLSClientConfig.GetClientCertificate = func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			tsCurr := utils.UnixTimestamp()
+			tsNext := ss.tlsCerts.nextRefreshTimestamp.Load()
+			if tsCurr < tsNext {
+				ss.log.Debug("current time is less than next refresh time for oauth client cert reload. so, skipping the reload of certificates")
+				return ss.tlsCerts.certs, nil
+			}
+			ss.log.Debug("current time is greater than next refresh time for oauth client certs reload. so, reloading the certificates")
+			ss.tlsCerts.nextRefreshTimestamp.Store(tsCurr + ss.tlsCerts.certRefreshDuration)
+			reloadedCerts, err := ss.readCertificates(info)
+			if err != nil {
+				ss.log.Error("unable to read oauth client certificates. error ", err)
+				return nil, err
+			}
+			ss.tlsCerts.certs = reloadedCerts
+			return ss.tlsCerts.certs, nil
 		}
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(caCert)
-		tr.TLSClientConfig.RootCAs = caCertPool
 	}
+
 	return oauthClient, nil
 }
 
@@ -221,6 +261,20 @@ func (ss *SocialService) getUsageStats(ctx context.Context) (map[string]any, err
 	}
 
 	return m, nil
+}
+
+func (ss *SocialService) readCertificates(info *social.OAuthInfo) (*tls.Certificate, error) {
+	var cert tls.Certificate
+	var err error
+
+	if info.TlsClientCert != "" || info.TlsClientKey != "" {
+		cert, err = tls.LoadX509KeyPair(info.TlsClientCert, info.TlsClientKey)
+		if err != nil {
+			ss.log.Error("Failed to setup TlsClientCert", "oauth", "error", err)
+			return nil, fmt.Errorf("failed to setup TlsClientCert: %w", err)
+		}
+	}
+	return &cert, nil
 }
 
 func createOAuthConnector(name string, info *social.OAuthInfo, cfg *setting.Cfg, ssoSettings ssosettings.Service, features featuremgmt.FeatureToggles, cache remotecache.CacheStorage) (social.SocialConnector, error) {
